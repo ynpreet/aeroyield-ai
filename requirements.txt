@@ -1,0 +1,2 @@
+# AeroYield AI demo.py uses Python's standard library ONLY. Nothing to install.
+# (No Streamlit UI is bundled; the plain-Python demo is the guaranteed entry point.)
