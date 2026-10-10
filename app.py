@@ -435,6 +435,8 @@ def _aero_table_text(v):
 
 
 def run_custom(params):
+    if not isinstance(params, dict):
+        params = {}
     dep = params.get("dep") or "SFO"
     dep = dep.strip().upper() if isinstance(dep, str) else "SFO"
     arr = params.get("arr") or "BOS"
