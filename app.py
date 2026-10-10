@@ -1,308 +1,156 @@
 #!/usr/bin/env python3
-"""AeroYield AI -- localhost web UI for the demo.
+"""AeroYield AI -- localhost web UI (stdlib only).
 
-STDLIB ONLY (http.server -- no Flask/Streamlit/pip, no API keys, offline).
-
-Usage:
-    python3 app.py
-Then open in Chrome: http://localhost:8004
-
-Endpoints:
-    GET /         -- single-page demo UI (inline CSS/JS, no external assets)
-    GET /api/run  -- runs `python3 demo.py` via subprocess, returns
-                     {"ok": true, "output": "..."} (or {"ok": false, ...})
-
-This file never modifies demo.py's behavior; it only executes it.
+Run:  python3 app.py   then open http://localhost:8004
+Serves a guided, personalized tour of demo.py (the tested artifact --
+demo.py is never modified here; it is only imported as a module and its
+canned subprocess run is unchanged).
 """
 
-import errno
+import contextlib
+import http.server
+import io
 import json
+import re
 import subprocess
 import sys
-from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+import urllib.parse
 from pathlib import Path
 
-PORT = 8004
 HOST = "127.0.0.1"
+PORT = 8004
 HERE = Path(__file__).resolve().parent
-DEMO = HERE / "demo.py"
+DEMO_PY = HERE / "demo.py"
 
-PAGE = """<!DOCTYPE html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>AeroYield AI &mdash; Agentic Airline Revenue Management (Live Demo)</title>
-<style>
-  :root{
-    --bg:#0b1220; --panel:#121c30; --panel2:#0f1728; --line:#22314f;
-    --ink:#e8eefc; --dim:#9fb0cc; --accent:#4cc2ff; --green:#3ddc84;
-    --amber:#ffc554; --red:#ff7a90; --violet:#b39dff;
-  }
-  *{box-sizing:border-box}
-  body{margin:0;background:var(--bg);color:var(--ink);
-       font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;
-       line-height:1.55}
-  .wrap{max-width:1080px;margin:0 auto;padding:28px 20px 64px}
-  header.top{border:1px solid var(--line);border-radius:14px;background:linear-gradient(135deg,#101c33,#0b1220);
-             padding:26px 28px;margin-bottom:20px}
-  header.top h1{margin:0 0 6px;font-size:30px;letter-spacing:.3px}
-  header.top h1 .ai{color:var(--accent)}
-  .tag{display:inline-block;font-size:12px;color:#0b1220;background:var(--amber);
-       border-radius:20px;padding:2px 10px;font-weight:700;margin-bottom:10px}
-  .sub{color:var(--dim);font-size:15px;margin:6px 0 0;max-width:900px}
-  .story{display:grid;grid-template-columns:1fr 1fr 1fr;gap:12px;margin:18px 0}
-  @media(max-width:760px){.story{grid-template-columns:1fr}}
-  .story .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px 16px}
-  .story .card h3{margin:0 0 6px;font-size:14px;color:var(--accent);text-transform:uppercase;letter-spacing:.6px}
-  .story .card p{margin:0;font-size:13.5px;color:var(--dim)}
-  .story .card b{color:var(--ink)}
-  .controls{display:flex;gap:12px;align-items:center;margin:18px 0;flex-wrap:wrap}
-  button.run{font-size:17px;font-weight:700;color:#06121f;background:linear-gradient(180deg,#6fd6ff,#3aa8ef);
-             border:0;border-radius:10px;padding:14px 30px;cursor:pointer}
-  button.run:hover{filter:brightness(1.08)}
-  button.run:disabled{opacity:.55;cursor:wait}
-  .hint{font-size:13px;color:var(--dim)}
-  .spinner{display:none;align-items:center;gap:10px;color:var(--dim);font-size:14px}
-  .spinner.on{display:flex}
-  .dot{width:12px;height:12px;border-radius:50%;background:var(--accent);animation:pulse 1s infinite}
-  @keyframes pulse{0%,100%{opacity:.25;transform:scale(.8)}50%{opacity:1;transform:scale(1.15)}}
-  .cols{display:grid;grid-template-columns:1.35fr 1fr;gap:14px;margin-top:8px}
-  @media(max-width:900px){.cols{grid-template-columns:1fr}}
-  .panel{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:16px 18px}
-  .panel h2{margin:0 0 10px;font-size:15px;text-transform:uppercase;letter-spacing:.8px;color:var(--dim)}
-  .panel h2 .n{color:var(--accent)}
-  .loop{display:flex;gap:6px;margin:0 0 12px;flex-wrap:wrap}
-  .loop span{font-size:12px;font-weight:700;padding:4px 10px;border-radius:20px;background:var(--panel2);
-             border:1px solid var(--line);color:var(--dim)}
-  .loop span.hot{color:#06121f;background:var(--green);border-color:var(--green)}
-  #trace{font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;font-size:12.6px;
-         max-height:640px;overflow:auto;background:var(--panel2);border:1px solid var(--line);
-         border-radius:8px;padding:12px 14px;white-space:pre-wrap}
-  #trace .blk{margin:10px 0 2px;padding:7px 10px;border-radius:6px;color:var(--amber);font-weight:700;
-             background:rgba(255,197,84,.07);border:1px solid rgba(255,197,84,.25)}
-  #trace .plan{margin:8px 0;padding:10px 12px;border-radius:8px;background:rgba(76,194,255,.10);
-             border:1px solid var(--accent);color:var(--ink);font-weight:700}
-  #trace .tool{margin:6px 0;padding:6px 10px;border-left:3px solid var(--violet);
-             background:rgba(179,157,255,.07)}
-  #trace .tool b{color:var(--violet)}
-  #trace .step{margin:8px 0 2px;font-weight:700;color:var(--green)}
-  #trace .dec{margin:6px 0;padding:8px 10px;border-radius:6px;background:rgba(61,220,132,.08);
-             border:1px solid rgba(61,220,132,.4)}
-  #trace .ln{color:var(--dim)}
-  #results .stat{display:flex;justify-content:space-between;gap:10px;padding:9px 2px;
-                 border-bottom:1px dashed var(--line);font-size:14px}
-  #results .stat:last-child{border-bottom:0}
-  #results .k{color:var(--dim)}
-  #results .v{font-weight:700;text-align:right}
-  #results .v.good{color:var(--green)}
-  #results .v.big{color:var(--amber);font-size:16px}
-  .empty{color:var(--dim);font-size:14px;text-align:center;padding:40px 10px}
-  .err{background:rgba(255,122,144,.1);border:1px solid var(--red);border-radius:8px;
-       padding:12px;color:var(--red);font-size:14px;margin-top:10px}
-  footer{margin-top:26px;color:var(--dim);font-size:12.5px;border-top:1px solid var(--line);padding-top:14px}
-  kbd{background:var(--panel2);border:1px solid var(--line);border-radius:4px;padding:1px 6px;font-size:12px}
-</style>
-</head>
-<body>
-<div class="wrap">
+sys.path.insert(0, str(HERE))
+import demo as DEMO  # the tested artifact: imported, never modified
 
-<header class="top">
-  <div class="tag">LIVE DEMO &mdash; runs locally, stdlib only</div>
-  <h1>AeroYield <span class="ai">AI</span> &mdash; An Agentic AI Revenue Management System for Airlines</h1>
-  <p class="sub"><i>&ldquo;The AI agent that thinks like an airline revenue manager.&rdquo;</i>
-  This is the <b>airline&rsquo;s</b> pricing agent &mdash; not a passenger price predictor.
-  One route (<b>SFO &rarr; BOS</b>), 180 seats, fare <b>$320</b>, 120 booked / 60 remaining,
-  14 days to departure. One orchestrator + three intelligence tools run the
-  <b>Observe &rarr; Analyze &rarr; Decide &rarr; Act &rarr; Verify</b> loop, out loud.
-  All data is synthetic sample data; price moves are staged to a simulated approval queue.</p>
-</header>
+COND_RE = re.compile(
+    r"(type 2 diabetes|type 1 diabetes|diabetes|hypertension|high blood pressure|"
+    r"kidney disease|ckd|heart disease|depression|asthma|arthritis|copd|hyperlipidemia)"
+)
 
-<div class="story">
-  <div class="card"><h3>The scenario</h3><p>Three events hit at once: a <b>Boston festival</b> is announced, <b>competitor fares rise</b>, and <b>booking pace</b> runs ahead of baseline.</p></div>
-  <div class="card"><h3>The decision</h3><p>The agent reads the signals, prices the event premium, and recommends <b>$320 &rarr; $350</b> &mdash; optimizing for <b>profit</b>, not just revenue.</p></div>
-  <div class="card"><h3>The twist</h3><p>A rival drops to <b>$270</b>. The agent verifies comparability, then <b>does not auto-follow</b> &mdash; it fences a <b>$299</b> bucket instead of starting a price war.</p></div>
-</div>
+def _capture_canned():
+    """Run the canned demo exactly as before (subprocess), capture stdout."""
+    proc = subprocess.run(
+        [sys.executable, str(DEMO_PY)],
+        cwd=str(HERE),
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    return proc.stdout or proc.stderr
 
-<div class="controls">
-  <button class="run" id="runBtn" onclick="runDemo()">&#9654; Run live demo</button>
-  <div class="spinner" id="spin"><div class="dot"></div> Running demo.py &hellip;</div>
-  <span class="hint">Executes <kbd>python3 demo.py</kbd> on this machine and renders the agent trace below. Deterministic: byte-identical every run.</span>
-</div>
-
-<div class="cols">
-  <div class="panel">
-    <h2><span class="n">01</span> &mdash; Agent trace</h2>
-    <div class="loop" id="loop">
-      <span data-s="OBSERVE">OBSERVE</span><span data-s="ANALYZE">ANALYZE</span><span data-s="DECIDE">DECIDE</span><span data-s="ACT">ACT</span><span data-s="VERIFY">VERIFY</span>
-    </div>
-    <div id="trace"><div class="empty">Press <b>&ldquo;Run live demo&rdquo;</b> to watch the agent work through the decision loop.</div></div>
-  </div>
-  <div class="panel">
-    <h2><span class="n">02</span> &mdash; Results</h2>
-    <div id="results"><div class="empty">Headline numbers appear here after the run.</div></div>
-  </div>
-</div>
-
-<footer>
-  AeroYield AI demo &mdash; served from <kbd>app.py</kbd> (Python stdlib <kbd>http.server</kbd>, localhost only, no network calls).
-  Full details, data-honesty notes, and speaker notes live in the README.
-</footer>
-</div>
-
-<script>
-function esc(s){return s.replace(/&/g,"&amp;").replace(/</g,"&lt;").replace(/>/g,"&gt;");}
-function runDemo(){
-  var btn=document.getElementById("runBtn"), spin=document.getElementById("spin");
-  btn.disabled=true; spin.classList.add("on");
-  document.querySelectorAll("#loop span").forEach(function(s){s.classList.remove("hot");});
-  var t0=performance.now(), step=0;
-  var cyc=setInterval(function(){ // animate the loop while the demo runs
-    var spans=document.querySelectorAll("#loop span");
-    spans.forEach(function(s){s.classList.remove("hot");});
-    spans[step%spans.length].classList.add("hot"); step++;
-  },350);
-  fetch("/api/run").then(function(r){return r.json();}).then(function(d){
-    clearInterval(cyc);
-    document.querySelectorAll("#loop span").forEach(function(s){s.classList.add("hot");});
-    spin.classList.remove("on"); btn.disabled=false;
-    var secs=((performance.now()-t0)/1000).toFixed(2);
-    if(d.ok){ renderTrace(d.output); renderResults(d.output, secs); }
-    else{
-      document.getElementById("trace").innerHTML='<div class="err"><b>Demo failed.</b><br>'+esc(d.error||"unknown error")+"</div>";
-      document.getElementById("results").innerHTML='<div class="empty">No results &mdash; the demo did not complete.</div>';
-    }
-  }).catch(function(e){
-    clearInterval(cyc); spin.classList.remove("on"); btn.disabled=false;
-    document.getElementById("trace").innerHTML='<div class="err"><b>Request failed:</b> '+esc(String(e))+"</div>";
-  });
-}
-function renderTrace(out){
-  var lines=out.split("\\n"), html="", bar=/^=+$/;
-  lines.forEach(function(raw){
-    var line=raw, cls="ln";
-    if(bar.test(line.trim())) return;                       // skip ===== separators
-    var t=line.trim();
-    if(t.indexOf("[ORCHESTRATOR] PLAN")==0){
-      html+='<div class="plan">&#9679; PLAN &mdash; '+esc(t.replace("[ORCHESTRATOR] PLAN -- ",""))+"</div>"; return;
-    }
-    if(t.indexOf("[ORCHESTRATOR]")==0){
-      html+='<div class="plan">'+esc(t)+"</div>"; return;
-    }
-    if(t.indexOf("[TOOL]")==0){ cls="tool"; }
-    else if(/^(OBSERVE|ANALYZE|DECIDE|ACT|VERIFY)(\\b| --)/.test(t)){ cls="step"; }
-    else if(t.indexOf("RECOMMENDATION:")==0){ cls="dec"; }
-    else if(/^LIVE SCENARIO|^TWIST|^SCENARIO SIMULATIONS|^KILLER DIFFERENTIATOR|^SUMMARY/.test(t)){
-      html+='<div class="blk">'+esc(t)+"</div>"; return;
-    }
-    var body=esc(line).split("$299").join("<b>$299</b>");
-    html+='<div class="'+cls+'">'+body+"</div>";
-  });
-  document.getElementById("trace").innerHTML=html;
-}
-function stat(k,v,cls){return '<div class="stat"><span class="k">'+k+'</span><span class="v '+(cls||"")+'">'+v+"</span></div>";}
-function renderResults(out, secs){
-  // demo.py prints "$320 -> $350" unescaped (raw subprocess stdout).
-  var m1=out.match(/RECOMMENDATION: (\\$320 -> \\$350)\\s*\\[([A-Z]+)\\]/);
-  var m2=out.match(/HEADLINE: agentic profit (\\$[0-9,]+) vs fixed (\\$[0-9,]+) \\(\\+(\\d+)%\\)/);
-  var m3=out.match(/agentic sold\\s+(\\d+) seats vs (\\d+); forecast error ([0-9.]+)% vs ([0-9.]+)%/);
-  var m4=out.match(/shock-scenario \\(S2\\)\\s+profit (\\$[0-9,]+) vs (\\$[0-9,]+)/);
-  var m5=out.match(/LESSON: (\\$280 -> \\$[0-9,]+) expected revenue BEATS (\\$400 -> \\$[0-9,]+)/);
-  var m6=out.match(/vs holding (\\$320): (\\+\\$[0-9,]+)/);
-  var h="";
-  if(m1) h+=stat("Recommendation", m1[1]+" &mdash; "+m1[2], "big");
-  if(m6) h+=stat("Expected gain vs holding $320", m6[2], "good");
-  if(m5) h+=stat("Counterintuitive lesson", m5[1]+" beats "+m5[2], "good");
-  if(m2) h+=stat("Agentic profit vs fixed fare", m2[1]+" vs "+m2[2]+" (+"+m2[3]+"%)", "good");
-  if(m3) h+=stat("Seats sold", m3[1]+" vs "+m3[2], "good");
-  if(m3) h+=stat("Forecast error", m3[3]+"% vs "+m3[4]+"%", "good");
-  if(m4) h+=stat("Shock-scenario (S2) profit", m4[1]+" vs "+m4[2], "good");
-  h+=stat("Competitor $270 response", "Fenced $299 bucket, hold $350", "good");
-  h+=stat("Run time", secs+"s &mdash; deterministic", "");
-  if(!h) h='<div class="empty">Could not parse results.</div>';
-  document.getElementById("results").innerHTML=h;
-}
-</script>
-</body>
-</html>
-"""
-
-
-def run_demo():
-    """Execute demo.py; return (ok, payload)."""
+def _capture_fn(fn, params):
+    buf = io.StringIO()
     try:
-        proc = subprocess.run(
-            [sys.executable, str(DEMO)],
-            capture_output=True,
-            text=True,
-            timeout=60,
-            cwd=str(HERE),
-        )
-    except subprocess.TimeoutExpired:
-        return False, {"error": "demo.py timed out after 60s"}
-    except OSError as e:
-        return False, {"error": "could not start demo.py: %s" % e}
-    if proc.returncode != 0:
-        return False, {"error": "demo.py exited %d: %s"
-                       % (proc.returncode, proc.stderr[-2000:])}
-    return True, {"output": proc.stdout}
+        with contextlib.redirect_stdout(buf):
+            return fn(params)
+    except Exception as exc:  # never crash the page on a bad input
+        return "[web-ui] The personalized run hit an error and stopped safely.\n%s: %s" % (type(exc).__name__, exc)
 
+# ---- personalized run: input handling lives in app.py; demo.py untouched ----
 
-class Handler(BaseHTTPRequestHandler):
-    server_version = "AeroYieldUI/1.0"
+_AERO_SCEN = {
+    "festival": (
+        "Festival announced: Boston Harbor Music Festival (Oct 23-25)",
+        "Event segment adds inelastic demand; the engine re-prices on the festival-adjusted demand curve.",
+        "D_FEST", 1.0,
+    ),
+    "competitor": (
+        "Competitor drops fare 20% (rival now ~$270)",
+        "Rival undercuts us; the demand curve shifts -- the agent re-evaluates instead of auto-matching.",
+        "D_COMP", 1.0,
+    ),
+    "fuel": (
+        "Fuel +10% (cost/pax $55 -> $60.50)",
+        "A cost signal, not a demand signal. Watch whether the fare moves at all.",
+        "D_BASE", 1.10,
+    ),
+    "pace": (
+        "Bookings below pace (soft demand)",
+        "Soft market: the engine checks whether any fare clears the human-approval change threshold.",
+        "D_SOFT", 1.0,
+    ),
+}
 
-    def log_message(self, fmt, *args):  # quieter logs
-        sys.stderr.write("[app] %s\n" % (fmt % args))
+def run_custom(params):
+    key = (params.get("scenario") or "festival").strip()
+    label, detail, curve_name, cost_mult = _AERO_SCEN.get(key, _AERO_SCEN["festival"])
+    curve = getattr(DEMO, curve_name)
+    cost = DEMO.COST_PER_PAX * cost_mult
+    out = io.StringIO()
+    with contextlib.redirect_stdout(out):
+        print("YOUR SCENARIO:", label)
+        print(detail)
+        print(f"Current fare ${DEMO.CURRENT_FARE} -- seats left {DEMO.SEATS_LEFT} -- change threshold {DEMO.usd(DEMO.CHANGE_THRESHOLD)}")
+        print()
+        rows = DEMO.evaluate(DEMO.CANDIDATES, curve, DEMO.SEATS_LEFT, cost)
+        DEMO.print_engine_table(rows, "expected contribution by fare (synthetic data)")
+        print()
+        best, cur, gain, action = DEMO.recommend(DEMO.CURRENT_FARE, rows, DEMO.CHANGE_THRESHOLD)
+        print(f"Before: hold ${DEMO.CURRENT_FARE} (current fare)")
+        print(f"After:  move to ${best[0]} [{action}] -- expected gain {DEMO.usd(gain)}")
+        if action == "HOLD":
+            print("The engine recommends HOLD: no fare beats the current one by the approval threshold.")
+        else:
+            print("If you approve, this change stages to the human approval queue (simulation) -- it never touches a booking system.")
+    return out.getvalue()
 
-    def _send(self, code, body, ctype):
+PAGE = '<!DOCTYPE html>\n<html lang="en">\n<head>\n<meta charset="utf-8">\n<meta name="viewport" content="width=device-width, initial-scale=1">\n<title>AeroYield AI &mdash; Live Demo</title>\n<style>\n:root{\n  --bg:#0b1220; --bg2:#0e1626; --panel:#131e33; --panel2:#182742;\n  --ink:#eaf0f9; --muted:#9db0c9; --faint:#6b7f99;\n  --teal:#2dd4bf; --teal-dim:rgba(45,212,191,.12);\n  --accent:#5aa9ff; --warn:#fbbf24; --danger:#f87171; --ok:#34d399;\n  --line:#233451; --radius:14px;\n}\n*{box-sizing:border-box}\nbody{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,Helvetica,Arial,sans-serif;\n  background:var(--bg);color:var(--ink);line-height:1.6}\nheader{background:linear-gradient(135deg,#0a2540 0%,#0e3a5c 60%,#0b4f4a 100%);\n  padding:42px 32px 34px;border-bottom:1px solid var(--line)}\n.wrap{max-width:1060px;margin:0 auto}\nheader h1{margin:0 0 8px;font-size:30px;letter-spacing:-.01em}\nheader .sub{margin:0;color:#c8d6ea;font-size:16px;max-width:800px}\n.badge{display:inline-block;margin-top:14px;font-size:11.5px;letter-spacing:.1em;\n  text-transform:uppercase;color:#06281f;background:var(--teal);\n  padding:5px 14px;border-radius:999px;font-weight:800}\nmain{padding:8px 32px 48px}\nsection.card{background:var(--panel);border:1px solid var(--line);\n  border-radius:var(--radius);padding:26px 28px;margin:26px 0}\nsection.card h2{margin:0 0 12px;font-size:18px;color:var(--teal)}\nsection.card h2 .n{display:inline-block;width:28px;height:28px;border-radius:50%;\n  background:var(--teal-dim);border:1px solid var(--teal);color:var(--teal);\n  text-align:center;line-height:26px;font-size:14px;margin-right:10px}\nsection.card p{margin:0 0 12px;color:#d5e0f1;font-size:15.5px}\nsection.card p:last-child{margin-bottom:0}\n.watch{list-style:none;margin:6px 0 0;padding:0}\n.watch li{position:relative;padding:8px 0 8px 30px;color:#d5e0f1;font-size:15px;\n  border-bottom:1px dashed var(--line)}\n.watch li:last-child{border-bottom:0}\n.watch li::before{content:"\\25b8";position:absolute;left:8px;color:var(--teal);font-weight:700}\nlabel.f{display:block;margin:14px 0 6px;font-size:13px;font-weight:700;\n  letter-spacing:.04em;text-transform:uppercase;color:var(--muted)}\ninput[type=text],input[type=number],select,textarea{\n  width:100%;background:var(--bg2);border:1px solid var(--line);color:var(--ink);\n  border-radius:10px;padding:11px 14px;font-size:15px;font-family:inherit}\ntextarea{min-height:76px;resize:vertical}\ninput:focus,select:focus,textarea:focus{outline:none;border-color:var(--teal)}\n.row2{display:grid;grid-template-columns:1fr 1fr;gap:14px}\n@media(max-width:700px){.row2{grid-template-columns:1fr}}\n.btnrow{display:flex;gap:14px;align-items:center;margin-top:20px;flex-wrap:wrap}\nbutton.run{background:linear-gradient(135deg,#14b8a6,#0d9488);border:0;\n  color:#04211c;font-weight:800;font-size:17px;padding:15px 34px;\n  border-radius:12px;cursor:pointer;box-shadow:0 6px 22px rgba(45,212,191,.25)}\nbutton.run:hover{filter:brightness(1.08)}\nbutton.run:disabled{opacity:.45;cursor:default;box-shadow:none}\nbutton.ghost{background:transparent;border:1px solid var(--teal);color:var(--teal);\n  font-weight:700;font-size:15px;padding:13px 26px;border-radius:12px;cursor:pointer}\nbutton.ghost:hover{background:var(--teal-dim)}\nbutton.ghost:disabled{opacity:.45;cursor:default}\n.hint{color:var(--muted);font-size:13.5px}\n.spinner{display:none;align-items:center;gap:10px;color:var(--muted);font-size:14px;margin-top:14px}\n.spinner.show{display:flex}\n.dot{width:12px;height:12px;border-radius:50%;background:var(--teal);\n  animation:pulse 1s infinite ease-in-out}\n@keyframes pulse{0%,100%{transform:scale(.6);opacity:.5}50%{transform:scale(1.2);opacity:1}}\n#output{display:none;margin-top:6px}\n#output.show{display:block}\n.out{background:#0a0f1c;border:1px solid var(--line);border-radius:12px;\n  padding:20px 22px;font-family:ui-monospace,SFMono-Regular,Menlo,Consolas,monospace;\n  font-size:13px;line-height:1.6;white-space:pre-wrap;word-wrap:break-word;\n  max-height:640px;overflow:auto;color:#c9d6ea}\n.sechead{color:var(--accent);font-weight:800;margin:18px 0 2px;font-size:13.5px}\n.sechead:first-child{margin-top:0}\n.seccap{background:var(--teal-dim);border-left:3px solid var(--teal);\n  padding:8px 12px;margin:4px 0 12px;border-radius:0 8px 8px 0;\n  font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;\n  font-size:13.5px;color:#bfe9e2}\n.tok-orch{color:var(--accent);font-weight:700}\n.tok-tool{color:var(--ok);font-weight:700}\n.tok-guard{color:var(--warn);font-weight:700}\n.tok-mem{color:#c084fc;font-weight:700}\n#takeaways{display:none}\n#takeaways.show{display:block}\n.take{background:rgba(52,211,153,.07);border:1px solid rgba(52,211,153,.4);\n  border-radius:var(--radius);padding:22px 26px;margin:26px 0}\n.take h2{color:var(--ok);margin:0 0 10px;font-size:18px}\n.take ul{margin:0;padding-left:20px}\n.take li{margin:8px 0;color:#d5e0f1;font-size:15px}\ntable.dec{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}\ntable.dec th{background:var(--panel2);color:var(--teal);text-align:left;\n  padding:10px 12px;font-size:12px;letter-spacing:.06em;text-transform:uppercase;\n  border-bottom:1px solid var(--line)}\ntable.dec td{padding:10px 12px;border-bottom:1px solid var(--line);vertical-align:top}\n.pill{display:inline-block;padding:3px 12px;border-radius:999px;font-weight:800;font-size:12px}\n.pill.v{background:var(--ok);color:#04281c}\n.pill.s{background:var(--faint);color:#0b1220}\nfooter{padding:26px 32px 40px;color:var(--faint);font-size:13.5px;text-align:center}\nfooter a{color:var(--teal);text-decoration:none}\nfooter a:hover{text-decoration:underline}\ndetails.raw{margin-top:14px}\ndetails.raw summary{cursor:pointer;color:var(--muted);font-size:13.5px}\n</style>\n</head>\n<body>\n<header><div class="wrap">\n  <h1>AeroYield AI</h1>\n  <p class="sub">The AI that thinks like an airline revenue manager — SFO to Boston, 180 seats, 14 days out.</p>\n  <span class="badge">DEMO 4 OF 8 · AGENTIC AI WORKSHOP</span>\n</div></header>\n<main><div class="wrap">\n\n<section class="card" id="story">\n  <h2><span class="n">1</span>The story</h2>\n  <p>You own the pricing for one flight: San Francisco to Boston, <b>180 seats, 120 already sold, 14 days to departure, current fare $320</b>. Every day you must decide: hold, raise, or cut — while festivals get announced, competitors move, and fuel prices jump.</p>\n<p>This demo runs your pricing desk as an agent. Three intelligence tools (demand signals, competitor fares, costs) feed a pricing engine that evaluates every candidate fare for expected <b>profit</b> — then stages the change for a human to approve. It never writes to a booking system. And watch the counterintuitive lesson first: <b>$280 beats $400</b> on expected revenue, because volume wins when demand is elastic.</p>\n</section>\n\n<section class="card" id="watch">\n  <h2><span class="n">2</span>What to watch for</h2>\n  <ul class="watch">\n<li>Watch the engine table: the same demand curve priced from $280 to $400 — and why the cheapest fare can win.</li>\n<li>Three events hit at once (festival, booking pace, competitor moves). Watch which signals the agent acts on — and which it deliberately ignores.</li>\n<li>The twist: a competitor drops to $270. The agent does <b>not</b> blindly follow — watch it re-evaluate.</li>\n<li>The finale: fixed pricing vs. rule-based vs. agentic AI on identical scenarios. The numbers decide.</li>\n  </ul>\n</section>\n\n\n\n<section class="card" id="tryown">\n  <h2><span class="n">✎</span>Try your own — fire an event</h2>\n  <p>You run the pricing desk. Fire an event and watch the engine re-price <b>before / after</b> — current fare $320, 60 seats left.</p>\n  <div class="btnrow">\n    <button class="ghost scen" data-s="festival">Festival announced</button>\n    <button class="ghost scen" data-s="competitor">Competitor drops fare 20%</button>\n    <button class="ghost scen" data-s="fuel">Fuel +10%</button>\n    <button class="ghost scen" data-s="pace">Bookings below pace</button>\n  </div>\n  <div class="spinner" id="cspin"><div class="dot"></div>Re-pricing…</div>\n</section>\n\n\n<section class="card" id="runbox">\n  <h2><span class="n">3</span>Run the demo</h2>\n  <p>Click below to run the full canned demonstration. It takes a few seconds.</p>\n  <div class="btnrow">\n    <button class="run" id="run">&#9654; Run live demo</button>\n  </div>\n  <div class="spinner" id="spin"><div class="dot"></div><span>The pricing engine is evaluating every fare…</span></div>\n  <div id="output">\n    <div class="out" id="outtext"></div>\n    <details class="raw"><summary>Show raw terminal output</summary>\n      <div class="out" id="rawtext"></div>\n    </details>\n  </div>\n</section>\n\n<section class="card" id="takeaways" style="display:none">\n  <div class="take">\n    <h2>What just happened</h2>\n    <ul>\n<li>$280 beat $400 on expected revenue ($48,200 vs $44,000) — higher price is not higher revenue when demand is elastic.</li>\n<li>The agent recommended $320 → $350 with its reasoning on the table: signals used, alternatives beaten, confidence stated, and what could invalidate it.</li>\n<li>Fuel +12% moved no fares: the agent separated a cost signal from a demand signal.</li>\n<li>Head-to-head, the agentic strategy beat fixed and rule-based pricing on profit, seats sold, and shock resilience.</li>\n<li>Try your own: fire the scenario buttons in “Try your own” — festival, competitor cut, fuel spike, soft demand.</li>\n    </ul>\n  </div>\n</section>\n\n</div></main>\n<footer><div class="wrap">\n  <a href="https://github.com/ynpreet/aeroyield-ai" target="_blank" rel="noopener">View the project on GitHub</a>\n  &nbsp;&middot;&nbsp; All data in this demo is synthetic / fictional.\n</div></footer>\n\n<script>\nconst SECTIONS = [["LIVE SCENARIO", "Three events hit at once. The agent runs its decision loop: Observe \\u2192 Analyze \\u2192 Decide \\u2192 Act \\u2192 Verify."], ["DECIDE --", "The recommendation: which fare maximizes expected profit, why it beats every alternative, and what could invalidate it."], ["ACT --", "Staged to the approval queue (simulation). A human approves \\u2014 this demo never touches a live booking system."], ["TWIST", "A competitor drops to $270. Watch the agent re-evaluate instead of auto-matching."], ["SCENARIO SIMULATIONS", "Same engine, injected shocks: festival announced, competitor cut, fuel spike, soft demand."], ["KILLER DIFFERENTIATOR", "Three strategies on identical scenarios: fixed vs. rule-based vs. agentic. Measured, not claimed."], ["SUMMARY", "End of run."]];\nfunction esc(s){return s.replace(/&/g,\'&amp;\').replace(/</g,\'&lt;\').replace(/>/g,\'&gt;\');}\nfunction decorate(line){\n  let h = esc(line);\n  h = h.replace(/\\[ORCHESTRATOR\\]/g,\'<span class="tok-orch">[ORCHESTRATOR]</span>\');\n  h = h.replace(/\\[TOOL [^\\]]+\\]/g,function(m){return \'<span class="tok-tool">\'+m+\'</span>\';});\n  h = h.replace(/\\[MEMORY\\]/g,\'<span class="tok-mem">[MEMORY]</span>\');\n  h = h.replace(/GUARDRAIL/g,\'<span class="tok-guard">GUARDRAIL</span>\');\n  return h;\n}\nfunction renderOut(text){\n  document.getElementById(\'rawtext\').textContent = text;\n  const lines = text.split(\'\\n\');\n  let html = \'\';\n  for(const line of lines){\n    let matched = null;\n    for(const s of SECTIONS){ if(line.indexOf(s.m) !== -1){ matched = s; break; } }\n    if(matched){\n      html += \'<div class="sechead">\'+decorate(line)+\'</div>\'+\n              \'<div class="seccap">\'+matched.c+\'</div>\';\n      continue;\n    }\n    html += decorate(line) + \'\\n\';\n  }\n  document.getElementById(\'outtext\').innerHTML = html;\n  document.getElementById(\'output\').classList.add(\'show\');\n  document.getElementById(\'output\').scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\nfunction showTakeaways(){\n  const t = document.getElementById(\'takeaways\');\n  t.style.display=\'block\'; t.classList.add(\'show\');\n  t.scrollIntoView({behavior:\'smooth\',block:\'start\'});\n}\ndocument.getElementById(\'run\').addEventListener(\'click\',function(){\n  const btn=this, spin=document.getElementById(\'spin\');\n  btn.disabled=true; spin.classList.add(\'show\');\n  fetch(\'/api/run\').then(r=>r.json()).then(j=>{\n    spin.classList.remove(\'show\'); btn.disabled=false;\n    renderOut(j.output);\n    if(typeof loadDecisionTable===\'function\') loadDecisionTable();\n    showTakeaways();\n  }).catch(e=>{spin.classList.remove(\'show\');btn.disabled=false;alert(\'Run failed: \'+e);});\n});\n\ndocument.querySelectorAll(\'.scen\').forEach(function(b){\n  b.addEventListener(\'click\',function(){\n    const spin=document.getElementById(\'cspin\'); spin.classList.add(\'show\');\n    document.querySelectorAll(\'.scen\').forEach(x=>x.disabled=true);\n    fetch(\'/api/custom\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n      body:JSON.stringify({scenario:b.dataset.s})})\n    .then(r=>r.json()).then(j=>{\n      spin.classList.remove(\'show\');\n      document.querySelectorAll(\'.scen\').forEach(x=>x.disabled=false);\n      if(j.error){alert(j.error);return;}\n      renderOut(j.output); showTakeaways();\n    })\n    .catch(e=>{spin.classList.remove(\'show\');\n      document.querySelectorAll(\'.scen\').forEach(x=>x.disabled=false);\n      alert(\'Scenario failed: \'+e);});\n  });\n});\nfunction collectCustom(){return {};}\n\nfunction wireCustom(){\n  const b=document.getElementById(\'customRun\');\n  if(!b) return;\n  b.addEventListener(\'click\',function(){\n    const spin=document.getElementById(\'cspin\');\n    b.disabled=true; spin.classList.add(\'show\');\n    fetch(\'/api/custom\',{method:\'POST\',headers:{\'Content-Type\':\'application/json\'},\n      body:JSON.stringify(collectCustom())})\n    .then(r=>r.json()).then(j=>{\n      spin.classList.remove(\'show\'); b.disabled=false;\n      if(j.error){alert(j.error);return;}\n      renderOut(j.output); showTakeaways();\n    }).catch(e=>{spin.classList.remove(\'show\');b.disabled=false;alert(\'Run failed: \'+e);});\n  });\n}\nwireCustom();\n</script>\n</body>\n</html>\n'
+
+class Handler(http.server.BaseHTTPRequestHandler):
+    server_version = "WorkshopUI/1.0"
+
+    def _send(self, body, ctype="text/html; charset=utf-8"):
         data = body.encode("utf-8")
-        self.send_response(code)
-        self.send_header("Content-Type", ctype + "; charset=utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
-        self.send_header("Cache-Control", "no-store")
         self.end_headers()
         self.wfile.write(data)
 
-    def do_GET(self):
-        if self.path == "/" or self.path.startswith("/?"):
-            self._send(200, PAGE, "text/html")
-        elif self.path == "/api/run":
-            ok, payload = run_demo()
-            payload["ok"] = ok
-            self._send(200, json.dumps(payload), "application/json")
-        else:
-            self._send(404, "not found", "text/plain")
+    def _json(self, obj):
+        self._send(json.dumps(obj), "application/json; charset=utf-8")
 
-    # Disallow anything that could change state.
-    def do_POST(self): self._send(405, "method not allowed", "text/plain")
-    def do_PUT(self): self._send(405, "method not allowed", "text/plain")
-    def do_DELETE(self): self._send(405, "method not allowed", "text/plain")
+    def _read_json(self):
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+        except (TypeError, ValueError):
+            length = 0
+        raw = self.rfile.read(length) if length else b"{}"
+        return json.loads(raw.decode("utf-8") or "{}")
+
+    def do_GET(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path in ("/", "/index.html"):
+            self._send(PAGE)
+        elif path == "/api/run":
+            self._json({"output": _capture_canned()})
+        else:
+            self.send_error(404, "not found")
+
+    def do_POST(self):
+        path = urllib.parse.urlsplit(self.path).path
+        if path == "/api/custom":
+            params = self._read_json()
+            self._json({"output": _capture_fn(run_custom, params)})
+        else:
+            self.send_error(404, "not found")
+
+    def log_message(self, fmt, *args):
+        sys.stderr.write("ui: " + (fmt % args) + "\n")
 
 
 def main():
-    server = ThreadingHTTPServer((HOST, PORT), Handler)
-    print("=" * 60)
-    print("  AeroYield AI -- demo web UI")
-    print()
-    print("  Open in Chrome: http://localhost:%d" % PORT)
-    print()
-    print("  (listening on %s:%d -- localhost only; Ctrl+C to stop)" % (HOST, PORT))
-    print("=" * 60)
-    sys.stdout.flush()
+    server = http.server.ThreadingHTTPServer((HOST, PORT), Handler)
+    print("AeroYield AI demo UI -> http://localhost:8004")
+    print("Press Ctrl-C to stop.")
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n[app] stopped.")
+        print("\nstopped.")
 
 
 if __name__ == "__main__":
-    try:
-        main()
-    except OSError as e:
-        if e.errno == errno.EADDRINUSE:
-            sys.stderr.write(
-                "\nERROR: port %d is already in use.\n"
-                "Another copy of app.py (or another app) is already listening.\n"
-                "Stop it first, then run: python3 app.py\n" % PORT)
-            sys.exit(1)
-        raise
+    main()
