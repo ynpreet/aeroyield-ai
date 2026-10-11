@@ -380,12 +380,18 @@ def _aero_signals(dep, arr, scenario, p, cost, threshold):
             "Shoppers buy down to the rival: our demand at %s falls. Matching blindly would torch margin."
             % DEMO.usd(cf),
             "The agent re-evaluates every fare on the shifted curve instead of auto-following.",
+            "Freshness caveat: re-shop the rival fare before approving any move \u2014 a stale %s "
+            "(sold out, repriced, unbookable) is a mirage fare, not a signal."
+            % DEMO.usd(rival),
         ]
     if scenario == "fuel":
         return [
             "Jet fuel spike: cost per passenger %s \u2192 %s on %s."
             % (DEMO.usd(55), DEMO.usd(cost), route),
             "A cost signal, not a demand signal \u2014 it trims margin; it does not mean fares rise.",
+            "Contribution-margin effect: margin per seat at %s falls %s \u2192 %s (\u2212%s/seat) "
+            "on unchanged demand \u2014 the whole hit is cost, not volume."
+            % (DEMO.usd(cf), DEMO.usd(cf - 55), DEMO.usd(cf - cost), DEMO.usd(cost - 55)),
             "Watch whether the fare moves at all: the engine only acts if profit clears %s."
             % DEMO.usd(threshold),
         ]
@@ -396,10 +402,25 @@ def _aero_signals(dep, arr, scenario, p, cost, threshold):
     ]
 
 
-def _aero_score(dep, arr, scenario):
+def _aero_score(dep, arr, scenario, fuel_pct=10.0, seats_left=None):
     p = _aero_params(dep, arr)
+    p = dict(p)  # per-run copy: the seats_left override below must not leak
+    try:
+        seats_left = int(seats_left)
+    except (TypeError, ValueError):
+        seats_left = None
+    if seats_left is None:
+        seats_left = p["seats_left"]
+    p["seats_left"] = max(0, min(_AERO_SEATS_TOTAL, seats_left))
     cf = p["base_fare"]
-    cost = 55.0 + (18.0 if scenario == "fuel" else 0.0)
+    try:
+        fuel_pct = float(fuel_pct)
+    except (TypeError, ValueError):
+        fuel_pct = 10.0
+    fuel_pct = max(0.0, fuel_pct)
+    # Cost mapping kept consistent with demo.py: fuel +10% -> cost/pax +$3
+    # (fuel is ~1/4 of the variable cost stack), so +1pp fuel -> +$0.25/pax.
+    cost = 55.0 + (0.25 * fuel_pct if scenario == "fuel" else 0.0)
     curve = _aero_curve(cf, p["demand_scale"], scenario)
     candidates = [cf - 40, cf - 20, cf, cf + 30, cf + 40, cf + 60, cf + 80]
     threshold = max(250, int(round(_AERO_CHANGE_THRESHOLD_REF * cf / 320.0)))
@@ -452,9 +473,11 @@ def run_custom(params):
         return {"output": "", "decision": None, "verdict": None,
                 "error": "Pick two different airports \u2014 even our agent can't sell %s\u2192%s."
                          % (dep, arr)}
-    v = _aero_score(dep, arr, scenario)
+    fuel_pct = params.get("fuel_pct", 10)        # % fuel-price rise (T2: pass 40)
+    seats_left = params.get("seats_left", None)  # int override (T3: pass 5)
+    v = _aero_score(dep, arr, scenario, fuel_pct=fuel_pct, seats_left=seats_left)
     if scenario != "baseline":
-        b = _aero_score(dep, arr, "baseline")
+        b = _aero_score(dep, arr, "baseline", seats_left=seats_left)
         v["baseline"] = {"recommended_fare": b["recommended_fare"],
                          "action": b["action"], "gain": b["gain"]}
     out = io.StringIO()
@@ -462,11 +485,16 @@ def run_custom(params):
         print("%s -- %s" % (v["route"], v["scenario_label"]))
         print("Current fare %s, %d seats left, approval threshold %s"
               % (DEMO.usd(v["current_fare"]), v["seats_left"], DEMO.usd(v["threshold"])))
+        hold_fare = (v["current_fare"] if v["action"] == "HOLD"
+                     else v["recommended_fare"])
+        verb = "CHANGE to" if v["action"] == "CHANGE" else "HOLD at"
         print("Verdict: %s %s -- expected gain %s, confidence %s"
-              % (v["action"], DEMO.usd(v["recommended_fare"]),
+              % (verb, DEMO.usd(hold_fare),
                  DEMO.usd(v["gain"]), v["confidence"]))
         for s in v["signals"]:
             print(" - " + s)
+        print("NOTE: all figures are synthetic/sample data -- no fare moves without")
+        print("human approval, and rival fares must be re-verified fresh first.")
     return {"output": out.getvalue(), "decision": None,
             "verdict": v, "table": _aero_table_text(v)}
 
